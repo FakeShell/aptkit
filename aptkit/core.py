@@ -931,6 +931,11 @@ class Transaction(DBusObject):
         before to reduce clicks to install packages from third party
         epositories: AddRepository -> UpdateCache -> InstallPackages
         """
+
+        # FuriOS: skip auth check for uid 32011
+        if self.uid == 32011:
+            return
+
         self.status = enums.STATUS_AUTHENTICATING
         action = self.ROLE_ACTION_MAP[self.role]
         if action is None:
