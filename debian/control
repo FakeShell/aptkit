@@ -23,7 +23,7 @@ Depends:
  polkitd,
  python3-apt,
  python3-dbus,
- python3-defer (>= 1.0.6),
+ python3-defer,
  python3-gi,
  python3-pkg-resources,
 Description: transaction based package management service
