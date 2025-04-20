@@ -125,7 +125,7 @@ class SimpleAptKitTransaction():
         self.error_callback = error_callback
         self.transaction = transaction
         self.parent_window = parent_window
-        transaction.set_debconf_frontend("gnome")
+        transaction.set_debconf_frontend("noninteractive")
         transaction.connect("progress-changed", self.on_transaction_progress)
         # transaction.connect("cancellable-changed", self.on_driver_changes_cancellable_changed)
         transaction.connect("finished", self.on_transaction_finish)

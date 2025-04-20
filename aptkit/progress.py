@@ -550,7 +550,7 @@ class DaemonForkProgress(object):
         # Run debconf through a proxy if available
         if self.transaction.debconf:
             os.putenv("DEBCONF_PIPE", self.transaction.debconf)
-            os.putenv("DEBIAN_FRONTEND", "passthrough")
+            os.putenv("DEBIAN_FRONTEND", "noninteractive")
             if log.level == logging.DEBUG:
                 os.putenv("DEBCONF_DEBUG", ".")
         elif not self.transaction.terminal:

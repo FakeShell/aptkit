@@ -47,7 +47,7 @@ class DebconfProxy(object):
     passthrough frontend.
     """
 
-    def __init__(self, frontend="gnome", socket_path=None):
+    def __init__(self, frontend="noninteractive", socket_path=None):
         """Initialize a new DebconfProxy instance.
 
         Keyword arguments:
@@ -169,7 +169,7 @@ def _test():
     socket_path = "/tmp/debconf.socket"
     if os.path.exists(socket_path):
         os.remove(socket_path)
-    proxy = DebconfProxy("gnome", socket_path)
+    proxy = DebconfProxy("noninteractive", socket_path)
     proxy.start()
     loop = GLib.MainLoop()
     loop.run()

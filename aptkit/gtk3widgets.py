@@ -619,7 +619,7 @@ class AptProgressDialog(Gtk.Dialog):
                 yield self._transaction.sync()
             else:
                 if self.debconf:
-                    yield self._transaction.set_debconf_frontend("gnome")
+                    yield self._transaction.set_debconf_frontend("noninteractive")
                 yield self._transaction.run()
             self.show_all()
         except Exception as error:
