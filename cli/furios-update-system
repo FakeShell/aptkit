@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Bardia Moshiri <bardia@furilabs.com>
+#
+# furios-update-system
+#
+# Workflow:
+#   1. Update cache
+#   2. Simulate safe upgrade to see what would change
+#   3. If updates exist, run safe upgrade
+#   4. Repeat safe upgrades until safe mode has nothing left
+#   5. Then try a full upgrade (safe_mode = False)
+#   6. Update cache again
+#   7. Then try safe mode again
+#   8. Repeat until both safe and full upgrades have nothing left
+
+import os
+import re
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+APTKIT_BUS_NAME = "org.aptkit"
+APTKIT_OBJECT_PATH = "/org/aptkit"
+APTKIT_INTERFACE = "org.aptkit"
+APTKIT_TRANSACTION_INTERFACE = "org.aptkit.transaction"
+
+VERSION_FILE = "/usr/share/furios-branding/furios-version"
+
+MAX_RETRIES = 10
+RETRY_DELAY_SECONDS = 5
+DBUS_CALL_TIMEOUT_MS = 60 * 60 * 1000
+SIMULATE_WAIT_TIMEOUT_SECONDS = 300
+RUN_WAIT_TIMEOUT_SECONDS = 7200
+
+last_progress = None
+last_status = None
+seen_download_descriptions = set()
+main_proxy = None
+
+class AptkitError(Exception):
+    pass
+
+def make_transaction_result(exit_state, packages=None, dependencies=None):
+    if packages is None:
+        packages = set()
+    if dependencies is None:
+        dependencies = set()
+    return {
+        "exit_state": exit_state,
+        "packages": set(packages),
+        "dependencies": set(dependencies),
+    }
+
+def get_all_updates(result):
+    return set(result["packages"]) | set(result["dependencies"])
+
+def has_updates(result):
+    return bool(get_all_updates(result))
+
+def reset_transaction_state():
+    global last_progress
+    global last_status
+    global seen_download_descriptions
+    last_progress = None
+    last_status = None
+    seen_download_descriptions = set()
+
+def print_updates(title, packages, dependencies):
+    pkg_list = sorted(set(packages))
+    dep_list = sorted(set(dependencies))
+
+    if not pkg_list and not dep_list:
+        print(f"{title}: none", flush=True)
+        return
+
+    print(f"{title}:", flush=True)
+
+    if pkg_list:
+        print("  Packages:", flush=True)
+        for pkg in pkg_list:
+            print(f"    {pkg}", flush=True)
+
+    if dep_list:
+        print("  Dependencies:", flush=True)
+        for dep in dep_list:
+            print(f"    {dep}", flush=True)
+
+def on_progress(progress):
+    global last_progress
+
+    if progress < 0 or progress > 100:
+        return
+
+    if progress == last_progress:
+        return
+
+    last_progress = progress
+    print(f"Progress: {progress}%", flush=True)
+
+def on_status(status):
+    global last_status
+
+    if not status:
+        return
+
+    if status == last_status:
+        return
+
+    last_status = status
+    print(f"Status: {status}", flush=True)
+
+def on_progress_download(data):
+    global seen_download_descriptions
+
+    try:
+        url, status, description, downloaded, total, message = data
+    except Exception:
+        return
+
+    description = (description or "").strip()
+    status = (status or "").strip()
+
+    if not description:
+        return
+
+    if status not in ("download-fetching", "download-done"):
+        return
+
+    key = f"{status}:{description}"
+    if key in seen_download_descriptions:
+        return
+
+    seen_download_descriptions.add(key)
+
+    if status == "download-fetching":
+        print(f"Downloading: {description}", flush=True)
+    elif status == "download-done":
+        print(f"Downloaded: {description}", flush=True)
+
+def init_main_proxy():
+    global main_proxy
+    main_proxy = Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SYSTEM,
+        Gio.DBusProxyFlags.NONE,
+        None,
+        APTKIT_BUS_NAME,
+        APTKIT_OBJECT_PATH,
+        APTKIT_INTERFACE,
+        None,
+    )
+
+def update_cache():
+    print("Updating package cache...", flush=True)
+    execute_main_transaction(
+        method_name="UpdateCache",
+        parameters=GLib.Variant("()", ()),
+        simulate=False,
+        show_updates=False,
+    )
+
+def simulate_upgrade(safe_mode):
+    mode = "safe"
+    if not safe_mode:
+        mode = "full"
+
+    print(f"Simulating {mode} upgrade...", flush=True)
+
+    result = execute_main_transaction(
+        method_name="UpgradeSystem",
+        parameters=GLib.Variant("(b)", (safe_mode,)),
+        simulate=True,
+        show_updates=True,
+    )
+
+    if has_updates(result):
+        print_updates(
+            "Packages to be processed",
+            result["packages"],
+            result["dependencies"],
+        )
+    else:
+        print(f"No updates found in {mode} mode.", flush=True)
+
+    return result
+
+def run_upgrade(safe_mode):
+    mode = "safe"
+    if not safe_mode:
+        mode = "full"
+
+    print(f"Running {mode} upgrade...", flush=True)
+
+    return execute_main_transaction(
+        method_name="UpgradeSystem",
+        parameters=GLib.Variant("(b)", (safe_mode,)),
+        simulate=False,
+        show_updates=True,
+    )
+
+def execute_main_transaction(method_name, parameters, simulate, show_updates):
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            transaction_path = call_main_method_get_transaction_path(
+                method_name,
+                parameters,
+            )
+            return run_transaction_once(
+                transaction_path=transaction_path,
+                simulate=simulate,
+                show_updates=show_updates,
+            )
+        except Exception as exc:
+            last_error = exc
+
+            if attempt >= MAX_RETRIES:
+                break
+
+            print(
+                f"Retry {attempt}/{MAX_RETRIES} after error: {exc}",
+                flush=True,
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    if last_error is None:
+        raise AptkitError("Unknown transaction failure")
+
+    if isinstance(last_error, AptkitError):
+        raise last_error
+
+    raise AptkitError(str(last_error))
+
+def call_main_method_get_transaction_path(method, parameters):
+    try:
+        result = main_proxy.call_sync(
+            method,
+            parameters,
+            Gio.DBusCallFlags.NONE,
+            DBUS_CALL_TIMEOUT_MS,
+            None,
+        )
+    except GLib.Error as exc:
+        raise AptkitError(f"{method} failed: {exc.message}") from exc
+
+    if result is None or result.n_children() < 1:
+        raise AptkitError(f"{method} returned an invalid result")
+
+    transaction_path = result.get_child_value(0).unpack()
+
+    if not isinstance(transaction_path, str) or not transaction_path:
+        raise AptkitError(f"{method} returned an invalid transaction path")
+
+    return transaction_path
+
+def unwrap_variant(variant):
+    if variant is None:
+        return None
+
+    current = variant
+
+    try:
+        while current is not None and current.is_of_type(GLib.VariantType.new("v")):
+            current = current.get_variant()
+    except Exception:
+        pass
+
+    return current
+
+def run_transaction_once(transaction_path, simulate, show_updates):
+    transaction_proxy = Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SYSTEM,
+        Gio.DBusProxyFlags.NONE,
+        None,
+        APTKIT_BUS_NAME,
+        transaction_path,
+        APTKIT_TRANSACTION_INTERFACE,
+        None,
+    )
+
+    reset_transaction_state()
+
+    state = {
+        "exit_state": None,
+        "packages": set(),
+        "dependencies": set(),
+        "error": None,
+        "finished_signal_state": None,
+        "simulate_ready": False,
+    }
+
+    loop = GLib.MainLoop()
+    timeout_id = None
+
+    def maybe_quit_if_final():
+        exit_state = state["exit_state"]
+
+        if exit_state in (
+            "exit-success",
+            "exit-cancelled",
+            "exit-failed",
+            "exit-previous-failed",
+        ):
+            if loop.is_running():
+                loop.quit()
+
+    def maybe_quit_if_simulate_ready():
+        if simulate and state["simulate_ready"] and loop.is_running():
+            loop.quit()
+
+    def refresh_initial_properties():
+        try:
+            packages_variant = unwrap_variant(
+                transaction_proxy.get_cached_property("Packages")
+            )
+            if packages_variant is not None:
+                state["packages"] = extract_packages_property(packages_variant)
+        except Exception as exc:
+            print(f"refresh_initial_properties Packages error: {exc}", flush=True)
+
+        try:
+            dependencies_variant = unwrap_variant(
+                transaction_proxy.get_cached_property("Dependencies")
+            )
+            if dependencies_variant is not None:
+                state["dependencies"] = extract_dependencies_property(
+                    dependencies_variant
+                )
+        except Exception as exc:
+            print(f"refresh_initial_properties Dependencies error: {exc}", flush=True)
+
+        try:
+            progress_variant = unwrap_variant(
+                transaction_proxy.get_cached_property("Progress")
+            )
+            if progress_variant is not None:
+                progress = progress_variant.unpack()
+                if isinstance(progress, int):
+                    on_progress(progress)
+        except Exception as exc:
+            print(f"refresh_initial_properties Progress error: {exc}", flush=True)
+
+        try:
+            status_variant = unwrap_variant(
+                transaction_proxy.get_cached_property("Status")
+            )
+            if status_variant is not None:
+                status = status_variant.unpack()
+                if isinstance(status, str):
+                    on_status(status)
+        except Exception as exc:
+            print(f"refresh_initial_properties Status error: {exc}", flush=True)
+
+        try:
+            exit_state_variant = unwrap_variant(
+                transaction_proxy.get_cached_property("ExitState")
+            )
+            if exit_state_variant is not None:
+                exit_state = exit_state_variant.unpack()
+                if isinstance(exit_state, str):
+                    state["exit_state"] = exit_state
+        except Exception as exc:
+            print(f"refresh_initial_properties ExitState error: {exc}", flush=True)
+
+    def on_timeout():
+        state["error"] = "Timed out waiting for transaction state"
+        if loop.is_running():
+            loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    def handle_property_changed(property_name, value_variant):
+        actual_variant = unwrap_variant(value_variant)
+
+        if actual_variant is None:
+            return
+
+        try:
+            value = actual_variant.unpack()
+        except Exception as exc:
+            state["error"] = f"Failed to unpack {property_name}: {exc}"
+            if loop.is_running():
+                loop.quit()
+            return
+
+        if property_name == "Packages":
+            state["packages"] = extract_packages_property(actual_variant)
+            if simulate:
+                state["simulate_ready"] = True
+                maybe_quit_if_simulate_ready()
+            return
+
+        if property_name == "Dependencies":
+            state["dependencies"] = extract_dependencies_property(actual_variant)
+            if simulate:
+                state["simulate_ready"] = True
+                maybe_quit_if_simulate_ready()
+            return
+
+        if property_name == "Progress":
+            if isinstance(value, int):
+                on_progress(value)
+            return
+
+        if property_name == "Status":
+            if isinstance(value, str):
+                on_status(value)
+            return
+
+        if property_name == "ProgressDownload":
+            if isinstance(value, tuple) and len(value) == 6:
+                on_progress_download(value)
+            return
+
+        if property_name == "ExitState":
+            if isinstance(value, str):
+                state["exit_state"] = value
+                if not simulate and value != "exit-unfinished":
+                    maybe_quit_if_final()
+            return
+
+    def on_signal(proxy, sender_name, signal_name, parameters):
+        if signal_name == "PropertyChanged":
+            try:
+                property_name = parameters.get_child_value(0).unpack()
+                value_variant = parameters.get_child_value(1)
+            except Exception as exc:
+                state["error"] = f"Failed to decode PropertyChanged signal: {exc}"
+                if loop.is_running():
+                    loop.quit()
+                return
+
+            handle_property_changed(property_name, value_variant)
+            return
+
+        if signal_name == "Finished":
+            try:
+                finished_state = parameters.get_child_value(0).unpack()
+                if isinstance(finished_state, str):
+                    state["finished_signal_state"] = finished_state
+
+                    if not simulate and state["exit_state"] in (None, "exit-unfinished"):
+                        if finished_state.lower().startswith("successful"):
+                            state["exit_state"] = "exit-success"
+
+                    if simulate:
+                        if state["packages"] or state["dependencies"]:
+                            state["simulate_ready"] = True
+                            maybe_quit_if_simulate_ready()
+                    else:
+                        maybe_quit_if_final()
+            except Exception as exc:
+                state["error"] = f"Failed to decode Finished signal: {exc}"
+                if loop.is_running():
+                    loop.quit()
+
+    signal_id = transaction_proxy.connect("g-signal", on_signal)
+
+    try:
+        method = "Simulate"
+        if not simulate:
+            method = "Run"
+
+        try:
+            transaction_proxy.call_sync(
+                method,
+                GLib.Variant("()", ()),
+                Gio.DBusCallFlags.NONE,
+                DBUS_CALL_TIMEOUT_MS,
+                None,
+            )
+        except GLib.Error as exc:
+            raise AptkitError(
+                f"{method} on transaction {transaction_path} failed: {exc.message}"
+            ) from exc
+
+        refresh_initial_properties()
+
+        if simulate:
+            if state["packages"] or state["dependencies"]:
+                state["simulate_ready"] = True
+
+            if not state["simulate_ready"]:
+                timeout_id = GLib.timeout_add_seconds(
+                    SIMULATE_WAIT_TIMEOUT_SECONDS,
+                    on_timeout,
+                )
+                loop.run()
+        else:
+            if state["exit_state"] in (
+                "exit-success",
+                "exit-cancelled",
+                "exit-failed",
+                "exit-previous-failed",
+            ):
+                maybe_quit_if_final()
+            else:
+                timeout_id = GLib.timeout_add_seconds(
+                    RUN_WAIT_TIMEOUT_SECONDS,
+                    on_timeout,
+                )
+                loop.run()
+
+        if timeout_id is not None:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+
+        if state["error"] is not None:
+            raise AptkitError(state["error"])
+
+        if simulate:
+            print("Simulation data collected.", flush=True)
+            return make_transaction_result(
+                exit_state="simulated",
+                packages=set(state["packages"]) if show_updates else set(),
+                dependencies=set(state["dependencies"]) if show_updates else set(),
+            )
+
+        exit_state = state["exit_state"]
+        print(f"Transaction finished with state: {exit_state}", flush=True)
+
+        if exit_state == "exit-success":
+            return make_transaction_result(
+                exit_state=exit_state,
+                packages=set(state["packages"]) if show_updates else set(),
+                dependencies=set(state["dependencies"]) if show_updates else set(),
+            )
+
+        if exit_state == "exit-cancelled":
+            raise AptkitError("Transaction was cancelled")
+
+        if exit_state == "exit-failed":
+            raise AptkitError("Transaction failed")
+
+        if exit_state == "exit-previous-failed":
+            raise AptkitError("Previous transaction failed")
+
+        if exit_state == "exit-unfinished" or exit_state is None:
+            raise AptkitError("Transaction never reached a final state")
+
+        raise AptkitError(f"Unexpected transaction exit state: {exit_state!r}")
+    finally:
+        try:
+            transaction_proxy.disconnect(signal_id)
+        except Exception:
+            pass
+
+def extract_packages_property(variant):
+    variant = unwrap_variant(variant)
+
+    if variant is None:
+        return set()
+
+    try:
+        groups = variant.unpack()
+
+        if not isinstance(groups, (list, tuple)) or len(groups) < 6:
+            return set()
+
+        if isinstance(groups[4], (list, tuple)):
+            upgrades = groups[4]
+        else:
+            upgrades = []
+
+        if isinstance(groups[5], (list, tuple)):
+            downgrades = groups[5]
+        else:
+            downgrades = []
+
+        results = set()
+
+        for entry in upgrades:
+            normalized = normalize_package_entry(entry)
+            if normalized:
+                results.add(normalized)
+
+        for entry in downgrades:
+            normalized = normalize_package_entry(entry)
+            if normalized:
+                results.add(normalized)
+
+        return results
+    except Exception:
+        return set()
+
+def extract_dependencies_property(variant):
+    variant = unwrap_variant(variant)
+
+    if variant is None:
+        return set()
+
+    try:
+        groups = variant.unpack()
+
+        if not isinstance(groups, (list, tuple)) or len(groups) < 6:
+            return set()
+
+        if isinstance(groups[4], (list, tuple)):
+            upgrades = groups[4]
+        else:
+            upgrades = []
+
+        if isinstance(groups[5], (list, tuple)):
+            downgrades = groups[5]
+        else:
+            downgrades = []
+
+        results = set()
+
+        for entry in upgrades:
+            normalized = normalize_package_entry(entry)
+            if normalized:
+                results.add(normalized)
+
+        for entry in downgrades:
+            normalized = normalize_package_entry(entry)
+            if normalized:
+                results.add(normalized)
+
+        return results
+    except Exception:
+        return set()
+
+def normalize_package_entry(entry):
+    if not isinstance(entry, str):
+        return ""
+
+    entry = entry.strip()
+
+    if not entry:
+        return ""
+
+    if "/" in entry:
+        entry = entry.split("/", 1)[0]
+
+    if "=" in entry:
+        entry = entry.split("=", 1)[0]
+
+    return entry.strip()
+
+def read_furios_version():
+    if not os.path.exists(VERSION_FILE):
+        return ""
+
+    try:
+        with open(VERSION_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError:
+        return ""
+
+    if not content:
+        return ""
+
+    match = re.search(r"\d+(?:\.\d+)+", content)
+    if match:
+        return match.group(0)
+
+    return content
+
+def drain_safe_updates():
+    changed = False
+
+    while True:
+        update_cache()
+        simulated = simulate_upgrade(safe_mode=True)
+
+        if not has_updates(simulated):
+            return changed
+
+        run_upgrade(safe_mode=True)
+        changed = True
+
+def full_upgrade_once():
+    update_cache()
+    simulated = simulate_upgrade(safe_mode=False)
+
+    if not has_updates(simulated):
+        return False
+
+    run_upgrade(safe_mode=False)
+    return True
+
+def main():
+    try:
+        init_main_proxy()
+
+        while True:
+            drain_safe_updates()
+
+            if full_upgrade_once():
+                continue
+
+            update_cache()
+            safe_check = simulate_upgrade(safe_mode=True)
+            if has_updates(safe_check):
+                run_upgrade(safe_mode=True)
+                continue
+
+            update_cache()
+            full_check = simulate_upgrade(safe_mode=False)
+            if has_updates(full_check):
+                run_upgrade(safe_mode=False)
+                continue
+
+            break
+
+        print("All updates have been fully applied.", flush=True)
+
+        version = read_furios_version()
+        if version:
+            print(f"FuriOS {version}", flush=True)
+
+        return 0
+    except AptkitError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 1
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr, flush=True)
+        return 130
+    except GLib.Error as exc:
+        print(f"error: {exc.message}", file=sys.stderr, flush=True)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
